@@ -1,0 +1,13 @@
+ultralytics>=8.2.0
+opencv-python>=4.8.0
+torch>=2.0.0
+torchvision>=0.15.0
+numpy>=1.23.0
+pandas>=2.0.0
+matplotlib>=3.7.0
+scipy>=1.10.0
+scikit-learn>=1.2.0
+streamlit>=1.30.0
+onnx>=1.15.0
+pillow>=9.5.0
+pypdf>=4.0.0
