@@ -259,13 +259,14 @@ class MultiViewPhotoAssociator:
         cost_threshold: float = 0.55
     ) -> List[MultiViewFruitCluster]:
         """
-        Mengasosiasikan deteksi dari berbagai sudut foto (0°, 45°, 90°, dsb.)
-        dan mengeliminasi penghitungan ganda (Duplicate Counting Removal).
+        Mengasosiasikan deteksi dari berbagai sudut foto (0°, 45°, 90°, ..., 315°)
+        secara melingkar (circular wrap-around) dan mengeliminasi penghitungan ganda.
         """
         view_names = list(view_detections.keys())
+        num_views = len(view_names)
         dsu = DisjointSetUnion()
 
-        # Buat identifier unik untuk setiap deteksi: (view_name, det_idx)
+        # Buat identifier unik untuk setiap deteksi: "nama_view::indeks_deteksi"
         all_items = []
         for v in view_names:
             for idx, det in enumerate(view_detections[v]):
@@ -273,29 +274,51 @@ class MultiViewPhotoAssociator:
                 all_items.append((token, v, det))
                 dsu.find(token)
 
-        # Bandingkan pasangan sudut yang berurutan (misal: 0° dengan 45°, 45° dengan 90°)
-        for i in range(len(view_names)):
-            for j in range(i + 1, min(i + 3, len(view_names))):
-                v1, v2 = view_names[i], view_names[j]
-                dets1 = view_detections[v1]
-                dets2 = view_detections[v2]
+        if num_views >= 2:
+            for i in range(num_views):
+                # Bandingkan dengan 2 sudut berikutnya secara melingkar (termasuk 315° -> 0° & 45°)
+                for step in [1, 2]:
+                    if num_views == 2 and step == 2:
+                        continue
+                    j = (i + step) % num_views
+                    if i == j:
+                        continue
 
-                if not dets1 or not dets2:
-                    continue
+                    v1, v2 = view_names[i], view_names[j]
+                    dets1 = view_detections[v1]
+                    dets2 = view_detections[v2]
 
-                # Bangun Cost Matrix
-                cost_matrix = np.full((len(dets1), len(dets2)), 999.0)
-                for idx1, d1 in enumerate(dets1):
-                    for idx2, d2 in enumerate(dets2):
-                        cost_matrix[idx1, idx2] = self.match_detections(d1, d2)
+                    if not dets1 or not dets2:
+                        continue
 
-                # Jalankan Hungarian Algorithm untuk optimal bipartite matching
-                row_ind, col_ind = linear_sum_assignment(cost_matrix)
-                for r, c in zip(row_ind, col_ind):
-                    if cost_matrix[r, c] <= cost_threshold:
-                        tok1 = f"{v1}::{r}"
-                        tok2 = f"{v2}::{c}"
-                        dsu.union(tok1, tok2)
+                    # Bangun Cost Matrix
+                    cost_matrix = np.full((len(dets1), len(dets2)), 999.0)
+                    for idx1, d1 in enumerate(dets1):
+                        for idx2, d2 in enumerate(dets2):
+                            cost_matrix[idx1, idx2] = self.match_detections(d1, d2)
+
+                    # Jalankan Hungarian Algorithm untuk optimal bipartite matching
+                    row_ind, col_ind = linear_sum_assignment(cost_matrix)
+                    for r, c in zip(row_ind, col_ind):
+                        if cost_matrix[r, c] <= cost_threshold:
+                            tok1 = f"{v1}::{r}"
+                            tok2 = f"{v2}::{c}"
+                            root1 = dsu.find(tok1)
+                            root2 = dsu.find(tok2)
+                            if root1 != root2:
+                                # Cegah penggabungan 2 buah berbeda dari sudut foto yang sama
+                                views_in_1 = {
+                                    tok.split("::")[0]
+                                    for tok, _, _ in all_items
+                                    if dsu.find(tok) == root1
+                                }
+                                views_in_2 = {
+                                    tok.split("::")[0]
+                                    for tok, _, _ in all_items
+                                    if dsu.find(tok) == root2
+                                }
+                                if views_in_1.isdisjoint(views_in_2):
+                                    dsu.union(tok1, tok2)
 
         # Kelompokkan hasil clustering ke Disjoint Set
         clusters_map: Dict[str, Dict[str, MangoDetection]] = {}
@@ -308,12 +331,10 @@ class MultiViewPhotoAssociator:
         # Bangun list MultiViewFruitCluster
         results: List[MultiViewFruitCluster] = []
         for fruit_idx, (root, views) in enumerate(clusters_map.items(), start=1):
-            # Tentukan kematangan dominan
             stages = [d.maturity_stage for d in views.values()]
             from collections import Counter
             dom_stage = Counter(stages).most_common(1)[0][0]
 
-            # Pilih gambar representatif dengan confidence tertinggi
             best_det = max(views.values(), key=lambda x: x.confidence)
             rep_img = best_det.crop_image
 

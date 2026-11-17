@@ -11,16 +11,11 @@ from src.preprocessing import preprocess_single_image, compute_blur_metric, enha
 from src.detector import MangoDetector, MATURITY_CLASSES, MATURITY_COLORS, summarize_maturity_counts
 from src.multi_view_association import (
     MultiViewPhotoAssociator,
-    TrackletAssociator,
-    Tracklet,
     track_and_count_video
 )
 from src.evaluation import (
     calculate_error_percentage,
-    estimate_harvest_yield,
     build_ablation_comparison_table,
-    export_markdown_report,
-    calculate_citrus_harvest_index,
     estimate_citrus_yield,
     build_citrus_telemetry_payload
 )
@@ -30,8 +25,6 @@ from src.llm_advisor import (
     generate_offline_heuristic_report,
     CitrusAdvisorConfig,
     DEFAULT_AIVO_API_KEY,
-    DEFAULT_AIVO_BASE_URL,
-    DEFAULT_MODEL
 )
 
 # Konfigurasi Halaman Streamlit
@@ -340,13 +333,19 @@ def main():
     # ==========================================
     # TAB 3: MULTI-VIEW & VIDEO TRACKING (KUNCI UTAMA)
     # ==========================================
+    # ==========================================
+    # TAB 3: MULTI-VIEW & VIDEO TRACKING (KUNCI UTAMA)
+    # ==========================================
     with tab3:
         st.subheader("3. Multi-View Association & Video Tracking (Eliminasi Duplikasi)")
-        st.write("Sesuai Bab 6 & 7 panduan UTS: Menyelesaikan tantangan terbesar penelitian, yaitu menghilangkan duplicate counting saat buah terlihat dari beberapa sudut atau tertutup daun.")
+        st.write("Sesuai Bab 6 & 7 panduan UTS: Menghilangkan duplicate counting saat buah terlihat dari beberapa sudut atau tertutup daun.")
 
         pipeline_mode = st.radio(
             "Pilih Mode Analisis Multi-Sudut:",
-            ["📸 Opsi A: Foto Multi-Sudut (0° - 315° via SIFT & Hungarian)", "🎥 Opsi B: Video Walkaround Pohon (Video Tracking & Tracklet Re-ID)"],
+            [
+                "📸 Opsi A: Foto Multi-Sudut (0° - 315° via SIFT & Hungarian)",
+                "🎥 Opsi B: Video Walkaround Pohon (Video Tracking & Tracklet Re-ID)"
+            ],
             horizontal=True
         )
 
@@ -354,98 +353,146 @@ def main():
         # OPSI A: FOTO MULTI-SUDUT
         # ----------------------------------------------------
         if pipeline_mode.startswith("📸"):
-            demo_dir = "data/raw/photos_multi_angle"
-            if os.path.exists(demo_dir):
-                all_angle_files = sorted([f for f in os.listdir(demo_dir) if f.endswith(".jpg")])
-                st.write(f"Tersedia **{len(all_angle_files)} citra sudut pandang pohon** (0°, 45°, 90°, ..., 315°):")
+            mv_source = st.radio(
+                "Sumber Foto Multi-Sudut:",
+                ["Gunakan Dataset Bawaan (8 Sudut)", "Unggah Beberapa Foto Sudut Sendiri (2–12 Foto)"],
+                horizontal=True,
+                key="mv_photo_source"
+            )
 
-                if st.button("🚀 Jalankan Multi-View Association pada Seluruh Sudut Foto", type="primary"):
-                    with st.spinner("Mengekstraksi fitur SIFT dan menjalankan Hungarian Algorithm..."):
-                        view_dets = {}
-                        naive_sum = 0
-                        for f in all_angle_files:
-                            p = os.path.join(demo_dir, f)
-                            frame = cv2.imread(p)
-                            d_list = detector.detect(frame, conf=conf_thresh, iou=iou_thresh)
-                            view_dets[f] = d_list
-                            naive_sum += len(d_list)
+            frames_to_process: Dict[str, np.ndarray] = {}
+            if mv_source == "Gunakan Dataset Bawaan (8 Sudut)":
+                demo_dir = "data/raw/photos_multi_angle"
+                if os.path.exists(demo_dir):
+                    all_angle_files = sorted([f for f in os.listdir(demo_dir) if f.lower().endswith((".jpg", ".jpeg", ".png"))])
+                    for f in all_angle_files:
+                        img_read = cv2.imread(os.path.join(demo_dir, f))
+                        if img_read is not None:
+                            frames_to_process[f] = img_read
+                    st.write(f"Tersedia **{len(frames_to_process)} citra sudut pandang pohon** (0°, 45°, 90°, ..., 315°):")
+                else:
+                    st.warning("Folder `data/raw/photos_multi_angle` tidak ditemukan.")
+            else:
+                multi_uploads = st.file_uploader(
+                    "Unggah 2–12 Foto Pohon Mangga dari Berbagai Sudut",
+                    type=["jpg", "jpeg", "png"],
+                    accept_multiple_files=True,
+                    key="mv_multi_upload"
+                )
+                if multi_uploads:
+                    for uf in multi_uploads:
+                        file_bytes = np.asarray(bytearray(uf.read()), dtype=np.uint8)
+                        decoded = cv2.imdecode(file_bytes, cv2.IMREAD_COLOR)
+                        if decoded is not None:
+                            frames_to_process[uf.name] = decoded
+                    st.success(f"✅ {len(frames_to_process)} foto sudut siap diproses.")
 
-                        associator = MultiViewPhotoAssociator()
-                        clusters = associator.associate_views(view_dets, cost_threshold=cost_thresh)
+            if frames_to_process and st.button("🚀 Jalankan Multi-View Association pada Seluruh Sudut Foto", type="primary"):
+                with st.spinner("Mengekstraksi fitur SIFT dan menjalankan Hungarian Algorithm..."):
+                    view_dets = {}
+                    naive_sum = 0
+                    for fname, frame in frames_to_process.items():
+                        frame_enh = enhance_contrast_clahe(frame)
+                        d_list = detector.detect(frame_enh, conf=conf_thresh, iou=iou_thresh) or []
+                        view_dets[fname] = d_list
+                        naive_sum += len(d_list)
 
-                        st.session_state["multi_view_results"] = {
-                            "mode": "photos",
-                            "naive_sum": naive_sum,
-                            "unique_count": len(clusters),
-                            "clusters": clusters,
-                            "view_dets": view_dets
-                        }
+                    associator = MultiViewPhotoAssociator()
+                    clusters = associator.associate_views(view_dets, cost_threshold=cost_thresh)
 
-                if "multi_view_results" in st.session_state and st.session_state["multi_view_results"]["mode"] == "photos":
-                    res = st.session_state["multi_view_results"]
+                    mat_dist = {"Unripe": 0, "Mature": 0, "Ripe": 0, "Harvest-ready": 0}
+                    for c in clusters:
+                        if c.dominant_maturity in mat_dist:
+                            mat_dist[c.dominant_maturity] += 1
+                        else:
+                            mat_dist["Unripe"] += 1
 
-                    m1, m2, m3 = st.columns(3)
-                    with m1:
-                        st.metric("Total Naive Sum (Semua Foto)", f"{res['naive_sum']} deteksi", delta="Overcount Parah", delta_color="inverse")
-                    with m2:
-                        st.metric("Hasil Akhir (Buah Unik)", f"{res['unique_count']} buah unik", delta=f"-{res['naive_sum'] - res['unique_count']} duplikasi dieliminasi", delta_color="normal")
-                    with m3:
-                        st.metric("Ground Truth (Aktual Lapangan)", f"{ground_truth_input} buah")
+                    st.session_state["multi_view_results"] = {
+                        "mode": "photos",
+                        "naive_sum": naive_sum,
+                        "unique_count": len(clusters),
+                        "clusters": clusters,
+                        "view_dets": view_dets,
+                        "maturity_distribution": mat_dist
+                    }
 
-                    st.markdown("---")
-                    st.markdown("#### 🥭 Bukti Asosiasi Buah Lintas Sudut (Cluster Unik):")
+            if "multi_view_results" in st.session_state and st.session_state["multi_view_results"]["mode"] == "photos":
+                res = st.session_state["multi_view_results"]
+
+                m1, m2, m3 = st.columns(3)
+                with m1:
+                    st.metric("Total Naive Sum (Semua Foto)", f"{res['naive_sum']} deteksi", delta="Overcount Parah", delta_color="inverse")
+                with m2:
+                    st.metric("Hasil Akhir (Buah Unik)", f"{res['unique_count']} buah unik", delta=f"-{res['naive_sum'] - res['unique_count']} duplikasi dieliminasi", delta_color="normal")
+                with m3:
+                    st.metric("Ground Truth (Aktual Lapangan)", f"{ground_truth_input} buah")
+
+                st.markdown("---")
+                st.markdown("#### 🥭 Bukti Asosiasi Buah Lintas Sudut (Cluster Unik):")
+                if not res["clusters"]:
+                    st.info("Tidak ada buah unik yang terdeteksi. Coba turunkan Confidence Threshold di sidebar.")
+                else:
                     cols = st.columns(4)
-                    for idx, cluster in enumerate(res["clusters"][:8]):
+                    for idx, cluster in enumerate(res["clusters"][:12]):
                         with cols[idx % 4]:
                             st.markdown(f"**Buah Unik #{cluster.fruit_id:02d}**")
                             st.caption(f"Tingkat: **{cluster.dominant_maturity}**")
                             if cluster.representative_image is not None and cluster.representative_image.size > 0:
                                 st.image(cv2.cvtColor(cluster.representative_image, cv2.COLOR_BGR2RGB), use_container_width=True)
-                            st.caption(f"Terlihat di sudut: {', '.join([k.replace('angle_', '').replace('.jpg', '°') for k in cluster.views.keys()])}")
+                            sudut_list = [k.replace("angle_", "").replace(".jpg", "°") for k in cluster.views.keys()]
+                            st.caption(f"Terlihat di: {', '.join(sudut_list)}")
 
         # ----------------------------------------------------
         # OPSI B: VIDEO TRACKING & TRACKLET RE-ID
         # ----------------------------------------------------
         else:
             st.markdown("#### Pelacakan Buah Berbasis Video Tracking & Tracklet Association")
-            st.write("Dosen Anda mencatat: Ketika kamera berputar atau buah tertutup dedaunan, pelacak biasa akan membuat ID baru (*ID-switch*). Modul ini secara otomatis menyambungkan kembali ID yang terputus menggunakan **Hungarian Algorithm + Visual Appearance Re-Identification**.")
+            st.write("Menyambungkan kembali ID buah yang terputus akibat oklusi dedaunan menggunakan **Hungarian Algorithm + Visual Appearance Re-Identification**.")
 
-            # Input video
-            chosen_video = video_path_selected if video_path_selected else "data/raw/video/mango_tree_walkaround.mp4"
+            if video_path_selected and os.path.exists(video_path_selected):
+                st.session_state["active_video_path"] = video_path_selected
 
-            frame_step = st.slider("Sampling Frame (Kecepatan Pemrosesan)", min_value=1, max_value=5, value=2, step=1, help="Lompati setiap N frame untuk mempercepat pelacakan")
+            chosen_video = st.session_state.get("active_video_path", "data/raw/video/mango_tree_walkaround.mp4")
+            st.caption(f"Video target: `{chosen_video}`")
+
+            frame_step = st.slider("Sampling Frame (Kecepatan Pemrosesan)", min_value=1, max_value=5, value=2, step=1)
 
             if st.button("🎬 Jalankan Video Tracking & Eliminasi ID-Switch", type="primary"):
-                progress_bar = st.progress(0.0)
-                status_txt = st.empty()
-                live_preview = st.empty()
+                if not os.path.exists(chosen_video):
+                    st.error(f"❌ File video tidak ditemukan: `{chosen_video}`")
+                else:
+                    progress_bar = st.progress(0.0)
+                    status_txt = st.empty()
+                    live_preview = st.empty()
 
-                def update_progress(current, total, frame):
-                    pct = min(1.0, current / max(1, total))
-                    progress_bar.progress(pct)
-                    status_txt.text(f"Memproses video: Frame {current} dari {total}...")
-                    if current % 3 == 0:
-                        live_preview.image(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB), use_container_width=True, caption=f"Live Tracking - Frame {current}")
+                    def update_progress(current, total, frame):
+                        pct = min(1.0, current / max(1, total))
+                        progress_bar.progress(pct)
+                        status_txt.text(f"Memproses video: Frame {current} dari {total}...")
+                        if current % 3 == 0:
+                            live_preview.image(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB), use_container_width=True, caption=f"Live Tracking - Frame {current}")
 
-                with st.spinner("Melakukan deteksi YOLO & Tracklet Re-Association pada video..."):
-                    vid_res = track_and_count_video(
-                        video_path=chosen_video,
-                        detector=detector,
-                        conf_thresh=conf_thresh,
-                        frame_step=frame_step,
-                        frame_callback=update_progress
-                    )
+                    with st.spinner("Melakukan deteksi YOLO & Tracklet Re-Association pada video..."):
+                        vid_res = track_and_count_video(
+                            video_path=chosen_video,
+                            detector=detector,
+                            conf_thresh=conf_thresh,
+                            frame_step=frame_step,
+                            frame_callback=update_progress
+                        )
 
-                progress_bar.progress(1.0)
-                status_txt.text("✅ Pelacakan dan Asosiasi Video Selesai!")
-
-                if vid_res.get("success"):
-                    st.session_state["multi_view_results"] = {
-                        "mode": "video",
-                        "naive_sum": vid_res["raw_track_count"],
-                        "unique_count": vid_res["unique_fruit_count"],
-                        "video_result": vid_res
-                    }
+                    if vid_res.get("success"):
+                        progress_bar.progress(1.0)
+                        status_txt.text("✅ Pelacakan dan Asosiasi Video Selesai!")
+                        st.session_state["multi_view_results"] = {
+                            "mode": "video",
+                            "naive_sum": vid_res["raw_track_count"],
+                            "unique_count": vid_res["unique_fruit_count"],
+                            "maturity_distribution": vid_res["maturity_distribution"],
+                            "video_result": vid_res
+                        }
+                    else:
+                        st.error(f"❌ Gagal memproses video: {vid_res.get('error', 'Terjadi kesalahan.')}")
 
             if "multi_view_results" in st.session_state and st.session_state["multi_view_results"]["mode"] == "video":
                 v_res = st.session_state["multi_view_results"]["video_result"]
